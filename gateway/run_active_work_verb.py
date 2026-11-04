@@ -1,17 +1,27 @@
 """``active-work`` control verb: what a stop/restart of this gateway would interrupt, answered live.
 
-``gateway_state.json`` names each unit only while draining and its ``active_agents`` total leaves out
-async delegations, so a CLI asking "may I stop this gateway?" could not see a background subagent
-that ``stop()`` interrupts (``tools.async_delegation.interrupt_all``). The verb answers from the
-running process instead: the same units the drain report publishes plus every live delegation.
+``gateway_state.json`` names each unit only while draining. The verb answers from the running
+process instead: the same units the drain report publishes, with identity details for delegations
+that ``stop()`` interrupts (``tools.async_delegation.interrupt_all``).
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
 from typing import Any, Callable
+
+
+def active_delegation_count() -> int:
+    """Process-local delegations interrupted at shutdown; an unreadable probe counts as 0."""
+    try:
+        from tools.async_delegation import active_count
+        return active_count()
+    except Exception:
+        logging.getLogger("gateway.run").debug("async-delegation count failed", exc_info=True)
+        return 0
 
 
 def _delegation_units(now: float) -> list[dict[str, Any]]:
@@ -62,7 +72,9 @@ def active_work_verb(runner, loop) -> Callable[[], dict[str, Any]]:
             # Everything that reads live authority state runs here, on the loop: a read on the socket
             # thread can race a worker being added and raise, and an error reads as "no work".
             try:
-                units = list(runner._describe_active_work()) + _delegation_units(time.time())
+                # Replace count-only delegation units with the detailed records, not a second copy.
+                units = [u for u in runner._describe_active_work() if u["kind"] != "delegation"]
+                units += _delegation_units(time.time())
                 if scoped:
                     units = _profile_units(runner, profile, units)
                     box.append({"active_agents": len(units), "active_work": units, "profile": profile})

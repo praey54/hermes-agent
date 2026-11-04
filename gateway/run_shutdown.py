@@ -27,6 +27,7 @@ from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_SERVICE_RESTART_EXIT_CODE,
     effective_stop_drain_timeout, effective_stop_watchdog_delay, resolve_cron_drain_budget
 )
+from gateway.run_active_work_verb import active_delegation_count
 from gateway.run_common import _UNSET
 from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_managed_turns
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
@@ -196,6 +197,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             self._running_agent_count()
             + managed_turn_count(self)
             + self._active_cron_job_count()
+            + active_delegation_count()
             + self._active_api_run_count()
             + self._active_deferred_agent_worker_count()
         )
@@ -213,15 +215,10 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         return len(get_running_job_ids())
 
     def _active_cron_job_count(self) -> int:
-        """Cron jobs currently executing — they run outside ``_running_agents``; 0 if cron can't import.
+        """In-flight cron jobs outside ``_running_agents``; an unreadable source counts as 0.
 
-        Cron jobs run through a standalone ``AIAgent`` on the scheduler's own thread pool
-        (``cron/scheduler.py::run_job``), entirely outside ``self._running_agents`` — the dict every OTHER
-        active-work check on this class (``_running_agent_count``, ``_drain_active_agents``) reads. Without
-        this, the shutdown drain is structurally blind to in-flight cron work: it can report
-        ``active_at_start=0`` and proceed straight to killing tool subprocesses while a cron job's terminal
-        command is still running (#60432). Best-effort: returns 0 if the cron module can't be imported (e.g.
-        a minimal test double for this class).
+        Cron jobs run on the scheduler's own thread pool. Without this counter the drain can kill
+        their tool subprocesses while reporting ``active_at_start=0`` (#60432).
         """
         try:
             return self._running_cron_job_count()
@@ -1552,7 +1549,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         restart-safe external worker (``_restart_safe_cron_count``), which outlives this process
         either way. Cron runs are counted per profile-scoped run by the scheduler, not by
         subtracting from the bare-ID active count: two profiles can run the same job ID, and one
-        excluded run must not hide the other.
+        excluded run must not hide the other. Delegations are never wedged-excluded; only the
+        restart-after-turn cap bounds their wait.
         """
         non_cron = (
             self._running_agent_count()
@@ -1563,6 +1561,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         return (
             max(0, non_cron - self._wedged_chat_agent_count())
             + self._restart_wait_cron_counts()["awaitable"]
+            + active_delegation_count()
         )
 
     def _describe_active_work(self) -> list:
@@ -1570,8 +1569,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         (``hermes update``, ``hermes gateway status``) can name it instead of printing a bare count.
 
         ``kind`` ∈ ``chat`` (session turn), ``cron`` (job id + external worker pid when the run was
-        handed to a restart-safe scope), ``managed`` / ``api`` / ``deferred`` (count only — those sources expose
-        no identity). Best-effort: a source that can't be read is omitted, never raises.
+        handed to a restart-safe scope), ``managed`` / ``api`` / ``deferred`` / ``delegation``
+        (count-only summaries). Best-effort: a source that can't be read is omitted, never raises.
         """
         from gateway.run import _AGENT_PENDING_SENTINEL
         now = time.time()
@@ -1601,7 +1600,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                               "wedged": job["job_id"] in wedged,
                               "restart_safe": bool(job.get("restart_safe"))})
         for kind, count in (("managed", managed_turn_count(self)), ("api", self._active_api_run_count()),
-                            ("deferred", self._active_deferred_agent_worker_count())):
+                            ("deferred", self._active_deferred_agent_worker_count()),
+                            ("delegation", active_delegation_count())):
             units.extend({"kind": kind, "pid": os.getpid()} for _ in range(count))
         return units
 
